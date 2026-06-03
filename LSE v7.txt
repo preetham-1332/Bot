@@ -1,0 +1,1301 @@
+//@version=6
+indicator("Liquidity Structure Engine v7", overlay=true, max_bars_back=1000)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ARCHITECTURE v7  (changes from v6 marked with [v7])
+//  ─────────────────────────────────────────────────────────────────────────
+//  Layer 1  │ Session Clock            — Tokyo / London / NY + transitions
+//  Layer 2  │ HTF Bias (1H)            — Structure read on higher timeframe
+//  Layer 3  │ VWAP (session)           — Institutional mean, session-anchored
+//  Layer 4  │ POC Approximation        — Highest volume node in lookback window
+//  Layer 5  │ POC/VWAP State           — Balance / Bull Imbalance / Bear Imbalance
+//  Layer 6  │ Session-Relative Volume  — Percentile vs same-session bars only
+//  Layer 7  │ Swing Structure          — HTF + LTF swing highs/lows
+//  Layer 8  │ Regime Detection         — Volatility vs Drift
+//  Layer 9  │ Sweep Detection          — Engineered stop runs with quality score
+//  Layer 10 │ Sweep Score (1–3)        — Session weight x structure confluence
+//  Layer 11 │ Drift Scalp Layer        — Low-vol momentum + candle character
+//  Layer 12 │ Tokyo Range Expansion    — [v6] Fixed: compared against prev bar's range
+//  Layer 13 │ Order Block Detection    — Single candle + impulse departure zones
+//  Layer 14 │ Consolidation Zones      — Multi-bar range zones
+//  Layer 15 │ Structural Exit Logic    — [v6] P8 reclaim filter + P9 VWAP exit
+//  Layer 16 │ Dashboard HUD            — Sectioned, premium design
+//  Layer 17 │ Initial Balance          — First-hour range: Asian / London / NY
+//
+//  v6 changes (4 fixes, aligned with Python lab P0-P13 audit):
+//  [FIX 1] POC: loop starts at i=1 (was i=0) — confirmed bars only, no intrabar repaint
+//  [FIX 2] TOKYO_BREAK: compare close against asianHighCandidate[1] / asianLowCandidate[1]
+//          The old liveAsianHigh included current bar's high, making break impossible on the
+//          trigger bar itself (close <= high always). Aligns with Python lab behaviour.
+//  [FIX 3] P8 reclaim filter: for Asian sweep entries, if close re-crosses swept level by
+//          3+ pts within 4 bars → invalidated, exit immediately.
+//  [FIX 4] P9 structural VWAP exit: backstop now requires close past VWAP + structural
+//          confirmation (HTF bias flipped OR POC on wrong side of VWAP). Removes the old
+//          bearFlow/bullFlow volume requirement which was too restrictive.
+//
+//  v7 changes (1 new setup, Python lab P0-P13 + NY_SWEEP backtest):
+//  [v7 ADD] NY_SWEEP: London Range (07:00-12:55 UTC) locked at NY open (13:00).
+//           Detects sweep of London session low/high + reversal candle with flow gate.
+//           LONG ONLY — backtest (200k M5 bars 2023-2026) shows TREND long at
+//           41.7% hit / +0.517 avg_R / PF=2.26; short side negative in both regimes.
+//           P8 reclaim filter extended to NY_SWEEP using London low as reference.
+//           HUD: new LONDON RNG row in SESSION section.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────── INPUTS ───────────────────────
+
+htfRes         = input.timeframe("60",  "HTF Resolution (Bias)",               group="Structure")
+pocLookback    = input.int(60,          "POC Lookback Bars",                    group="Structure", minval=20, maxval=300)
+swingLen       = input.int(20,          "Swing Lookback (LTF)",                 group="Structure", minval=5,  maxval=50)
+swingLenHTF    = input.int(40,          "Swing Lookback (HTF)",                 group="Structure", minval=10, maxval=100)
+
+volPercentile  = input.int(75,          "Volume Surge Percentile",              group="Volume",    minval=50, maxval=95)
+volLookback    = input.int(80,          "Session Volume Window (bars)",         group="Volume",    minval=30, maxval=200)
+
+sweepWickMin   = input.float(0.7,       "Min Sweep Wick (ATR x)",               group="Sweep",     minval=0.2, maxval=2.0, step=0.05)
+pocVwapThresh  = input.float(0.3,       "Balance Threshold (ATR x)",            group="Sweep",     minval=0.1, maxval=0.8, step=0.05)
+minSweepScore  = input.int(2,           "Min Score to Signal (1-3)",            group="Sweep",     minval=1,   maxval=3)
+
+// [v6 FIX 3] P8 reclaim filter parameters
+reclaimBars    = input.int(4,           "P8 Reclaim Window (bars)",             group="Sweep",     minval=1,   maxval=10)
+reclaimPts     = input.float(3.0,       "P8 Reclaim Distance (pts)",            group="Sweep",     minval=0.5, maxval=10.0, step=0.5)
+
+regimeLookback = input.int(20,          "Regime ATR Lookback",                  group="Regime",    minval=10, maxval=50)
+regimeThresh   = input.float(0.6,       "Drift/Volatile Threshold (ATR ratio)", group="Regime",    minval=0.3, maxval=1.0, step=0.05)
+driftBars      = input.int(3,           "Drift Confirmation Bars",              group="Regime",    minval=2,  maxval=6)
+
+driftBodyMin   = input.float(0.4,       "Min Body for Drift Candle (ATR x)",    group="Drift",     minval=0.2, maxval=1.0, step=0.05)
+driftVolMin    = input.int(50,          "Min Vol Percentile (Drift)",           group="Drift",     minval=30, maxval=80)
+pocLeaveMin    = input.float(0.5,       "POC Leave-Behind (ATR x)",             group="Drift",     minval=0.2, maxval=2.0, step=0.05)
+
+tokyoBreakBody = input.float(0.3,       "Tokyo Break Min Body (ATR x)",         group="Tokyo",     minval=0.1, maxval=1.0, step=0.05)
+tokyoConfBars  = input.int(2,           "Tokyo Break Confirmation Bars",        group="Tokyo",     minval=1,  maxval=4)
+
+obImpulseMin   = input.float(1.5,       "OB Impulse Strength (ATR x)",          group="Order Blocks", minval=0.8, maxval=4.0, step=0.1)
+obProximity    = input.float(0.3,       "OB Exit Proximity (ATR x)",            group="Order Blocks", minval=0.1, maxval=1.0, step=0.05)
+
+consBars       = input.int(4,           "Consolidation Min Bars",               group="Consolidation", minval=3, maxval=10)
+consRangeMax   = input.float(0.5,       "Max Range for Consolidation (ATR x)",  group="Consolidation", minval=0.2, maxval=1.5, step=0.05)
+
+tokyoOpen      = input.int(0,           "Tokyo Open  (UTC hour)",               group="Sessions",  minval=0, maxval=23)
+tokyoClose     = input.int(9,           "Tokyo Close (UTC hour)",               group="Sessions",  minval=0, maxval=23)
+londonOpen     = input.int(7,           "London Open (UTC hour)",               group="Sessions",  minval=0, maxval=23)
+londonClose    = input.int(16,          "London Close(UTC hour)",               group="Sessions",  minval=0, maxval=23)
+nyOpen         = input.int(13,          "NY Open     (UTC hour)",               group="Sessions",  minval=0, maxval=23)
+nyClose        = input.int(22,          "NY Close    (UTC hour)",               group="Sessions",  minval=0, maxval=23)
+
+atrLen         = input.int(14,          "ATR Length",                           group="Core")
+
+hudPos         = input.string("Top Right", "Panel Position",
+     options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+     group="Panel")
+
+// ─────────────────────── CORE ───────────────────────
+
+atr  = ta.atr(atrLen)
+vwap = ta.vwap(hlc3)
+
+// ─────────────────────── SESSION CLOCK ───────────────────────
+
+currentHour      = hour(time, "UTC")
+inTokyo          = currentHour >= tokyoOpen  and currentHour < tokyoClose
+inLondon         = currentHour >= londonOpen and currentHour < londonClose
+inNY             = currentHour >= nyOpen     and currentHour < nyClose
+londonTransition = currentHour == londonOpen
+nyTransition     = currentHour == nyOpen
+
+sessionLabel =
+     londonTransition ? "LONDON OPEN" :
+     nyTransition     ? "NY / COMEX"  :
+     inLondon         ? "LONDON"      :
+     inNY             ? "NEW YORK"    :
+     inTokyo          ? "TOKYO"       :
+     "OFF-SESSION"
+
+sessionWeight =
+     londonTransition ? 3 :
+     nyTransition     ? 3 :
+     inLondon         ? 2 :
+     inNY             ? 2 :
+     inTokyo          ? 1 : 0
+
+// ─────────────────────── HTF BIAS ───────────────────────
+
+htfClose = request.security(syminfo.tickerid, htfRes, close,          lookahead=barmerge.lookahead_off)
+htfVwap  = request.security(syminfo.tickerid, htfRes, ta.vwap(hlc3),  lookahead=barmerge.lookahead_off)
+htfHigh  = request.security(syminfo.tickerid, htfRes, high,           lookahead=barmerge.lookahead_off)
+htfLow   = request.security(syminfo.tickerid, htfRes, low,            lookahead=barmerge.lookahead_off)
+htfAtr   = request.security(syminfo.tickerid, htfRes, ta.atr(atrLen), lookahead=barmerge.lookahead_off)
+
+htfBullBias = htfClose > htfVwap
+htfBearBias = htfClose < htfVwap
+htfNeutral  = math.abs(htfClose - htfVwap) < htfAtr * pocVwapThresh
+
+// ─────────────────────── POC ───────────────────────
+// [v6 FIX 1] Loop starts at i=1 (skip forming bar) to prevent intrabar POC repaint.
+// close[0] changes tick-by-tick; close[1] onwards are confirmed closed bars.
+
+var float poc = na
+float maxVol  = 0.0
+for i = 1 to pocLookback
+    if volume[i] > maxVol
+        maxVol := volume[i]
+        poc    := close[i]
+
+pocVwapDelta   = poc - vwap
+pocVwapBalance = math.abs(pocVwapDelta) < atr * pocVwapThresh
+bullImbalance  = poc > vwap and not pocVwapBalance
+bearImbalance  = poc < vwap and not pocVwapBalance
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LAYER 6 — SESSION-RELATIVE VOLUME NORMALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+sessionVolRank  = 0.0
+sessionVolCount = 0
+
+for i = 1 to volLookback
+    barInTokyo  = hour(time[i], "UTC") >= tokyoOpen  and hour(time[i], "UTC") < tokyoClose
+    barInLondon = hour(time[i], "UTC") >= londonOpen and hour(time[i], "UTC") < londonClose
+    barInNY     = hour(time[i], "UTC") >= nyOpen     and hour(time[i], "UTC") < nyClose
+
+    sameSession =
+         (inTokyo  and barInTokyo)  or
+         (inLondon and barInLondon) or
+         (inNY     and barInNY)     or
+         (not inTokyo and not inLondon and not inNY and
+          not barInTokyo and not barInLondon and not barInNY)
+
+    if sameSession
+        sessionVolCount += 1
+        if volume[i] < volume
+            sessionVolRank += 1
+
+volRank = sessionVolCount > 5 ? (sessionVolRank / sessionVolCount * 100) : 50.0
+
+bodySize   = math.abs(close - open)
+bodyPct    = bodySize / atr
+
+volSurge   = volRank >= volPercentile
+absorption = volSurge and bodyPct < 0.35
+bullFlow   = volSurge and close > open and bodyPct > 0.5
+bearFlow   = volSurge and close < open and bodyPct > 0.5
+driftVolOk = volRank >= driftVolMin
+
+// ─────────────────────── SWING STRUCTURE ───────────────────────
+
+ltfSwingHigh = ta.pivothigh(high,    swingLen,    swingLen)
+ltfSwingLow  = ta.pivotlow(low,     swingLen,    swingLen)
+htfSwingHigh = ta.pivothigh(htfHigh, swingLenHTF, swingLenHTF)
+htfSwingLow  = ta.pivotlow(htfLow,  swingLenHTF, swingLenHTF)
+
+var float lastLTFHigh = na
+var float lastLTFLow  = na
+var float lastHTFHigh = na
+var float lastHTFLow  = na
+
+if not na(ltfSwingHigh)
+    lastLTFHigh := ltfSwingHigh
+if not na(ltfSwingLow)
+    lastLTFLow  := ltfSwingLow
+if not na(htfSwingHigh)
+    lastHTFHigh := htfSwingHigh
+if not na(htfSwingLow)
+    lastHTFLow  := htfSwingLow
+
+// ─────────────────────── ASIAN RANGE ───────────────────────
+
+var float asianHigh          = na
+var float asianLow           = na
+var float asianHighCandidate = na
+var float asianLowCandidate  = na
+
+if currentHour == tokyoOpen and currentHour[1] != tokyoOpen
+    asianHighCandidate := high
+    asianLowCandidate  := low
+
+if inTokyo
+    asianHighCandidate := na(asianHighCandidate) ? high : math.max(asianHighCandidate, high)
+    asianLowCandidate  := na(asianLowCandidate)  ? low  : math.min(asianLowCandidate,  low)
+
+if currentHour == londonOpen
+    asianHigh := asianHighCandidate
+    asianLow  := asianLowCandidate
+
+// ─────────────────────── LONDON RANGE (for NY_SWEEP) ───────────────────────
+// [v7 ADD 1] London Range = max/min of pre-NY London bars (07:00-12:55 UTC).
+// Locked at NY open exactly as Asian Range is locked at London open.
+
+var float londonHigh          = na
+var float londonLow           = na
+var float londonHighCandidate = na
+var float londonLowCandidate  = na
+
+if currentHour == londonOpen and currentHour[1] != londonOpen
+    londonHighCandidate := high
+    londonLowCandidate  := low
+
+if inLondon and currentHour < nyOpen
+    londonHighCandidate := na(londonHighCandidate) ? high : math.max(londonHighCandidate, high)
+    londonLowCandidate  := na(londonLowCandidate)  ? low  : math.min(londonLowCandidate,  low)
+
+if currentHour == nyOpen
+    londonHigh := londonHighCandidate
+    londonLow  := londonLowCandidate
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LAYER 17 — INITIAL BALANCE (ASIAN / LONDON / NY)
+// ═══════════════════════════════════════════════════════════════════════════
+
+inAsianIBHour  = currentHour == tokyoOpen
+inLondonIBHour = currentHour == londonOpen
+inNYIBHour     = currentHour == nyOpen
+
+// ── Asian IB ──────────────────────────────────────────────────────────────
+var float asianIBHighBuild = na
+var float asianIBLowBuild  = na
+var float asianIBHigh      = na
+var float asianIBLow       = na
+
+if inAsianIBHour and not inAsianIBHour[1]
+    asianIBHighBuild := high
+    asianIBLowBuild  := low
+
+if inAsianIBHour
+    asianIBHighBuild := na(asianIBHighBuild) ? high : math.max(asianIBHighBuild, high)
+    asianIBLowBuild  := na(asianIBLowBuild)  ? low  : math.min(asianIBLowBuild,  low)
+
+if not inAsianIBHour and inAsianIBHour[1]
+    asianIBHigh := asianIBHighBuild
+    asianIBLow  := asianIBLowBuild
+
+// ── London IB ─────────────────────────────────────────────────────────────
+var float londonIBHighBuild = na
+var float londonIBLowBuild  = na
+var float londonIBHigh      = na
+var float londonIBLow       = na
+
+if inLondonIBHour and not inLondonIBHour[1]
+    londonIBHighBuild := high
+    londonIBLowBuild  := low
+
+if inLondonIBHour
+    londonIBHighBuild := na(londonIBHighBuild) ? high : math.max(londonIBHighBuild, high)
+    londonIBLowBuild  := na(londonIBLowBuild)  ? low  : math.min(londonIBLowBuild,  low)
+
+if not inLondonIBHour and inLondonIBHour[1]
+    londonIBHigh := londonIBHighBuild
+    londonIBLow  := londonIBLowBuild
+
+// ── NY IB ──────────────────────────────────────────────────────────────────
+var float nyIBHighBuild = na
+var float nyIBLowBuild  = na
+var float nyIBHigh      = na
+var float nyIBLow       = na
+
+if inNYIBHour and not inNYIBHour[1]
+    nyIBHighBuild := high
+    nyIBLowBuild  := low
+
+if inNYIBHour
+    nyIBHighBuild := na(nyIBHighBuild) ? high : math.max(nyIBHighBuild, high)
+    nyIBLowBuild  := na(nyIBLowBuild)  ? low  : math.min(nyIBLowBuild,  low)
+
+if not inNYIBHour and inNYIBHour[1]
+    nyIBHigh := nyIBHighBuild
+    nyIBLow  := nyIBLowBuild
+
+// ── Active IB Reference ────────────────────────────────────────────────────
+activeIBHigh =
+     inAsianIBHour  ? asianIBHighBuild  :
+     inLondonIBHour ? londonIBHighBuild :
+     inNYIBHour     ? nyIBHighBuild     :
+     inTokyo        ? asianIBHigh       :
+     inLondon       ? londonIBHigh      :
+     inNY           ? nyIBHigh          : na
+
+activeIBLow =
+     inAsianIBHour  ? asianIBLowBuild   :
+     inLondonIBHour ? londonIBLowBuild  :
+     inNYIBHour     ? nyIBLowBuild      :
+     inTokyo        ? asianIBLow        :
+     inLondon       ? londonIBLow       :
+     inNY           ? nyIBLow           : na
+
+ibBuilding = inAsianIBHour or inLondonIBHour or inNYIBHour
+ibAbove    = not na(activeIBHigh) and close > activeIBHigh and not ibBuilding
+ibBelow    = not na(activeIBLow)  and close < activeIBLow  and not ibBuilding
+ibInside   = not ibAbove and not ibBelow and not na(activeIBHigh) and not ibBuilding
+
+ibBullBreak = ibAbove and not ibAbove[1]
+ibBearBreak = ibBelow and not ibBelow[1]
+
+// ─────────────────────── REGIME DETECTION ───────────────────────
+
+atrMean        = ta.sma(atr, regimeLookback)
+atrRatio       = atr / atrMean
+regimeVolatile = atrRatio > (1.0 + regimeThresh)
+regimeDrift    = atrRatio < (1.0 - regimeThresh * 0.5)
+regimeNeutral  = not regimeVolatile and not regimeDrift
+
+regimeLabel =
+     regimeVolatile ? "VOLATILE" :
+     regimeDrift    ? "DRIFT"    :
+     "NEUTRAL"
+
+// ─────────────────────── CANDLE CHARACTER ───────────────────────
+
+bullCandle = close > open and bodySize > atr * driftBodyMin
+bearCandle = close < open and bodySize > atr * driftBodyMin
+
+var int bullCount = 0
+var int bearCount = 0
+bullCount := bullCandle ? bullCount + 1 : 0
+bearCount := bearCandle ? bearCount + 1 : 0
+
+bullMomentum = bullCount >= driftBars
+bearMomentum = bearCount >= driftBars
+
+// ─────────────────────── MICRO STRUCTURE ───────────────────────
+
+bullMicroStr = high > high[1] and low > low[1]
+bearMicroStr = high < high[1] and low < low[1]
+
+var int bullMicroCount = 0
+var int bearMicroCount = 0
+bullMicroCount := bullMicroStr ? bullMicroCount + 1 : 0
+bearMicroCount := bearMicroStr ? bearMicroCount + 1 : 0
+
+bullMicroConfirmed = bullMicroCount >= driftBars
+bearMicroConfirmed = bearMicroCount >= driftBars
+
+// ─────────────────────── POC LEAVE-BEHIND ───────────────────────
+
+pocLeftBehindBull = close > poc and (close - poc) > atr * pocLeaveMin
+pocLeftBehindBear = close < poc and (poc - close) > atr * pocLeaveMin
+
+// ─────────────────────── VWAP RIDE ───────────────────────
+
+var int barsAboveVwap = 0
+var int barsBelowVwap = 0
+barsAboveVwap := close > vwap ? barsAboveVwap + 1 : 0
+barsBelowVwap := close < vwap ? barsBelowVwap + 1 : 0
+
+vwapRideBull = barsAboveVwap >= driftBars
+vwapRideBear = barsBelowVwap >= driftBars
+
+// ─────────────────────── DRIFT CONDITIONS ───────────────────────
+
+driftLong =
+     regimeDrift        and
+     bullMomentum       and
+     bullMicroConfirmed and
+     pocLeftBehindBull  and
+     vwapRideBull       and
+     htfBullBias        and
+     driftVolOk
+
+driftShort =
+     regimeDrift        and
+     bearMomentum       and
+     bearMicroConfirmed and
+     pocLeftBehindBear  and
+     vwapRideBear       and
+     htfBearBias        and
+     driftVolOk
+
+// ─────────────────────── LAYER 12: TOKYO RANGE EXPANSION ───────────────────────
+// [v6 FIX 2] Compare close against the PREVIOUS bar's Asian range candidate, not
+// the live (current-bar-inclusive) candidate. The old liveAsianHigh included the
+// current bar's high, making close > liveAsianHigh impossible on the trigger bar
+// (close <= high always). Using [1] gives confirmed-bar comparison, matching the
+// Python lab backtest which uses prev_tok_high.
+
+var int tokyoBars = 0
+tokyoBars := inTokyo ? tokyoBars + 1 : 0
+
+tokyoRangeReady = tokyoBars >= 10 and not na(asianHighCandidate) and not na(asianLowCandidate)
+
+// [v6 FIX 2] Use previous bar's candidate (confirmed) instead of live (repainting)
+prevAsianHighCandidate = nz(asianHighCandidate[1], asianHigh)
+prevAsianLowCandidate  = nz(asianLowCandidate[1],  asianLow)
+
+tokyoBullBreak = inTokyo and tokyoRangeReady and
+     not na(prevAsianHighCandidate) and
+     close > prevAsianHighCandidate and
+     bodySize > atr * tokyoBreakBody and
+     close > open
+
+tokyoBearBreak = inTokyo and tokyoRangeReady and
+     not na(prevAsianLowCandidate) and
+     close < prevAsianLowCandidate and
+     bodySize > atr * tokyoBreakBody and
+     close < open
+
+var int tokyoBullBreakCount = 0
+var int tokyoBearBreakCount = 0
+tokyoBullBreakCount := tokyoBullBreak ? tokyoBullBreakCount + 1 : 0
+tokyoBearBreakCount := tokyoBearBreak ? tokyoBearBreakCount + 1 : 0
+
+tokyoLong  = tokyoBullBreakCount == tokyoConfBars and htfBullBias
+tokyoShort = tokyoBearBreakCount == tokyoConfBars and htfBearBias
+
+// ─────────────────────── SWEEP DETECTION ───────────────────────
+
+bullSweepLTF   = false
+bullSweepHTF   = false
+bullSweepAsian = false
+bearSweepLTF   = false
+bearSweepHTF   = false
+bearSweepAsian = false
+
+if not na(lastLTFLow)
+    bullSweepLTF := low < lastLTFLow and close > lastLTFLow and (lastLTFLow - low) > atr * sweepWickMin
+if not na(lastHTFLow)
+    bullSweepHTF := low < lastHTFLow and close > lastHTFLow and (lastHTFLow - low) > atr * sweepWickMin
+if not na(asianLow) and londonTransition
+    bullSweepAsian := low < asianLow and close > asianLow and (asianLow - low) > atr * sweepWickMin * 0.7
+
+if not na(lastLTFHigh)
+    bearSweepLTF := high > lastLTFHigh and close < lastLTFHigh and (high - lastLTFHigh) > atr * sweepWickMin
+if not na(lastHTFHigh)
+    bearSweepHTF := high > lastHTFHigh and close < lastHTFHigh and (high - lastHTFHigh) > atr * sweepWickMin
+if not na(asianHigh) and londonTransition
+    bearSweepAsian := high > asianHigh and close < asianHigh and (high - asianHigh) > atr * sweepWickMin * 0.7
+
+bullSweep = bullSweepLTF or bullSweepHTF or bullSweepAsian
+bearSweep = bearSweepLTF or bearSweepHTF or bearSweepAsian
+
+// [v7 ADD 2] NY_SWEEP — London Range sweep at NY open hour
+// LONG only: backtest shows short has no edge (negative avg_R in both regimes).
+// Same wick threshold as Asian sweep (sweepWickMin * 0.7).
+bullSweepNY = false
+if not na(londonLow) and nyTransition
+    bullSweepNY := low < londonLow and close > londonLow and
+         (londonLow - low) > atr * sweepWickMin * 0.7
+
+nySweepLong = bullSweepNY and (bullFlow or absorption) and not regimeDrift
+
+// ─────────────────────── SWEEP SCORING ───────────────────────
+
+bullSweepScore = 0
+bearSweepScore = 0
+
+if bullSweep
+    bullSweepScore := 1
+    if bullImbalance or (poc > vwap and not pocVwapBalance)
+        bullSweepScore += 1
+    if sessionWeight >= 2
+        bullSweepScore += 1
+
+if bearSweep
+    bearSweepScore := 1
+    if bearImbalance or (poc < vwap and not pocVwapBalance)
+        bearSweepScore += 1
+    if sessionWeight >= 2
+        bearSweepScore += 1
+
+bullSweepScore := htfBearBias and not htfNeutral ? math.min(bullSweepScore, 1) : bullSweepScore
+bearSweepScore := htfBullBias and not htfNeutral ? math.min(bearSweepScore, 1) : bearSweepScore
+
+// ─────────────────────── FAKEOUT ───────────────────────
+
+var bool prevBullBreakout = false
+var bool prevBearBreakout = false
+
+bullBreakout = not na(lastLTFLow)  and close < lastLTFLow  and volSurge
+bearBreakout = not na(lastLTFHigh) and close > lastLTFHigh and volSurge
+
+prevBullBreakout := bullBreakout[1]
+prevBearBreakout := bearBreakout[1]
+
+bullFakeout = prevBullBreakout and close > lastLTFLow[1]
+bearFakeout = prevBearBreakout and close < lastLTFHigh[1]
+
+// ─────────────────────── ORDER BLOCKS ───────────────────────
+
+bullImpulse = (close - open) > atr * obImpulseMin and close > open
+bearImpulse = (open - close) > atr * obImpulseMin and close < open
+
+var float bearOBHigh  = na
+var float bearOBLow   = na
+var float bullOBHigh  = na
+var float bullOBLow   = na
+var bool  bearOBValid = false
+var bool  bullOBValid = false
+
+if bearImpulse and close[1] > open[1]
+    bearOBHigh  := high[1]
+    bearOBLow   := low[1]
+    bearOBValid := true
+
+if bullImpulse and close[1] < open[1]
+    bullOBHigh  := high[1]
+    bullOBLow   := low[1]
+    bullOBValid := true
+
+if bearOBValid and not na(bearOBLow) and close > bearOBHigh
+    bearOBValid := false
+if bullOBValid and not na(bullOBHigh) and close < bullOBLow
+    bullOBValid := false
+
+nearBearOB = bearOBValid and not na(bearOBHigh) and high >= (bearOBLow - atr * obProximity)
+nearBullOB = bullOBValid and not na(bullOBLow)  and low  <= (bullOBHigh + atr * obProximity)
+
+// ─────────────────────── CONSOLIDATION ZONES ───────────────────────
+
+consRangeHigh = ta.highest(high, consBars)
+consRangeLow  = ta.lowest(low,   consBars)
+consRange     = consRangeHigh - consRangeLow
+isConsolidating = consRange < atr * consRangeMax
+
+var float consZoneHigh   = na
+var float consZoneLow    = na
+var bool  consZoneValid  = false
+var bool  wasConsolidating = false
+
+if wasConsolidating and not isConsolidating
+    consZoneHigh  := consRangeHigh[1]
+    consZoneLow   := consRangeLow[1]
+    consZoneValid := true
+
+wasConsolidating := isConsolidating
+
+if consZoneValid
+    if close > consZoneHigh + atr * 0.2 or close < consZoneLow - atr * 0.2
+        consZoneValid := false
+
+reEntryFromBelow = consZoneValid and not na(consZoneLow) and
+     close[1] < consZoneLow and close >= consZoneLow
+
+reEntryFromAbove = consZoneValid and not na(consZoneHigh) and
+     close[1] > consZoneHigh and close <= consZoneHigh
+
+// ─────────────────────── ENTRY CONDITIONS ───────────────────────
+
+longCondition =
+     (regimeVolatile and bullSweep and bullSweepScore >= minSweepScore and (bullFlow or absorption)) or
+     (regimeNeutral  and bullSweep and bullSweepScore == 3             and (bullFlow or absorption)) or
+     driftLong or
+     tokyoLong or
+     nySweepLong    // [v7] NY_SWEEP: London Range sweep at NY open, long only
+
+shortCondition =
+     (regimeVolatile and bearSweep and bearSweepScore >= minSweepScore and (bearFlow or absorption)) or
+     (regimeNeutral  and bearSweep and bearSweepScore == 3             and (bearFlow or absorption)) or
+     driftShort or
+     tokyoShort
+
+// ─────────────────────── STRUCTURAL EXIT TARGETS ───────────────────────
+
+f_longTarget(entryPrice) =>
+    target = float(na)
+    if bearOBValid and not na(bearOBLow) and bearOBLow > entryPrice
+        if na(target) or bearOBLow < target
+            target := bearOBLow
+    if consZoneValid and not na(consZoneHigh) and consZoneLow > entryPrice
+        if na(target) or consZoneLow < target
+            target := consZoneLow
+    if not na(lastLTFHigh) and lastLTFHigh > entryPrice
+        if na(target) or lastLTFHigh < target
+            target := lastLTFHigh
+    if not na(lastHTFHigh) and lastHTFHigh > entryPrice
+        if na(target) or lastHTFHigh < target
+            target := lastHTFHigh
+    if not na(poc) and poc > entryPrice
+        if na(target) or poc < target
+            target := poc
+    target
+
+f_shortTarget(entryPrice) =>
+    target = float(na)
+    if bullOBValid and not na(bullOBHigh) and bullOBHigh < entryPrice
+        if na(target) or bullOBHigh > target
+            target := bullOBHigh
+    if consZoneValid and not na(consZoneLow) and consZoneHigh < entryPrice
+        if na(target) or consZoneHigh > target
+            target := consZoneHigh
+    if not na(lastLTFLow) and lastLTFLow < entryPrice
+        if na(target) or lastLTFLow > target
+            target := lastLTFLow
+    if not na(lastHTFLow) and lastHTFLow < entryPrice
+        if na(target) or lastHTFLow > target
+            target := lastHTFLow
+    if not na(poc) and poc < entryPrice
+        if na(target) or poc > target
+            target := poc
+    target
+
+// ─────────────────────── POSITION STATE ───────────────────────
+
+var int   pos              = 0
+var float longEntryPrice   = na
+var float shortEntryPrice  = na
+var float longTargetLevel  = na
+var float shortTargetLevel = na
+var bool  inDriftLong      = false
+var bool  inDriftShort     = false
+var bool  inTokyoLong      = false
+var bool  inTokyoShort     = false
+
+// [v6 FIX 3] P8 reclaim filter state
+var bool  inNYSweepLong = false    // [v7] NY_SWEEP entry tracker
+var bool  inSweepLong   = false
+var bool  inSweepShort  = false
+var float sweepRefLo    = na    // Asian low at entry (bull sweep long)
+var float sweepRefHi    = na    // Asian high at entry (bear sweep short)
+var int   sweepEntryBar = 0
+
+buySignal  = false
+sellSignal = false
+exitLong   = false
+exitShort  = false
+
+if pos == 0
+    if longCondition
+        buySignal       := true
+        pos             := 1
+        inDriftLong     := driftLong
+        inTokyoLong     := tokyoLong
+        inDriftShort    := false
+        inTokyoShort    := false
+        longEntryPrice  := close
+        longTargetLevel := f_longTarget(close)
+        // [v6 FIX 3] Track Asian sweep entries; [v7] also track NY_SWEEP entries
+        inSweepLong     := bullSweepAsian
+        inSweepShort    := false
+        inNYSweepLong   := nySweepLong
+        if bullSweepAsian
+            sweepRefLo    := asianLow
+            sweepEntryBar := bar_index
+        if nySweepLong
+            sweepRefLo    := londonLow    // [v7] P8 reference = London low
+            sweepEntryBar := bar_index
+
+    else if shortCondition
+        sellSignal       := true
+        pos              := -1
+        inDriftShort     := driftShort
+        inTokyoShort     := tokyoShort
+        inDriftLong      := false
+        inTokyoLong      := false
+        shortEntryPrice  := close
+        shortTargetLevel := f_shortTarget(close)
+        // [v6 FIX 3] Track Asian sweep entries for P8 reclaim check
+        inSweepShort     := bearSweepAsian
+        inSweepLong      := false
+        if bearSweepAsian
+            sweepRefHi    := asianHigh
+            sweepEntryBar := bar_index
+
+else if pos == 1
+    primaryExitLong  = not na(longTargetLevel) and high >= longTargetLevel
+    consExitLong     = reEntryFromBelow
+    obExitLong       = nearBearOB
+    tokyoExitLong    = inTokyoLong and (not inTokyo or
+         (not na(prevAsianLowCandidate) and low <= prevAsianLowCandidate))
+
+    // [v6 FIX 3] P8: exit if price re-closes through swept Asian low by reclaimPts
+    // within reclaimBars bars of the sweep entry
+    reclaimLong = inSweepLong and not na(sweepRefLo) and
+         (bar_index - sweepEntryBar) <= reclaimBars and
+         close < sweepRefLo - reclaimPts
+
+    // [v6 FIX 4] P9 structural VWAP exit: close below VWAP + HTF flipped OR POC below VWAP
+    // Replaces old rule (close < vwap AND bearFlow) which required volume surge
+    backstopLong =
+         (bearSweep and bearSweepScore >= 2) or
+         (close < vwap and (htfBearBias or poc < vwap) and not inDriftLong and not inTokyoLong)
+
+    // [v7] P8 reclaim filter extended to NY_SWEEP
+    reclaimNYSweep = inNYSweepLong and not na(sweepRefLo) and
+         (bar_index - sweepEntryBar) <= reclaimBars and
+         close < sweepRefLo - reclaimPts
+
+    if primaryExitLong or consExitLong or obExitLong or tokyoExitLong or reclaimLong or reclaimNYSweep
+        exitLong        := true
+        pos             := 0
+        longTargetLevel := na
+        inDriftLong     := false
+        inTokyoLong     := false
+        inSweepLong     := false   // [v6] reset P8 state
+        inNYSweepLong   := false   // [v7]
+        sweepRefLo      := na
+
+    else if backstopLong
+        exitLong        := true
+        pos             := 0
+        longTargetLevel := na
+        inDriftLong     := false
+        inTokyoLong     := false
+        inSweepLong     := false   // [v6] reset P8 state
+        inNYSweepLong   := false   // [v7]
+        sweepRefLo      := na
+
+    if pos == 1 and shortCondition
+        exitLong         := true
+        sellSignal       := true
+        pos              := -1
+        inDriftShort     := driftShort
+        inTokyoShort     := tokyoShort
+        inDriftLong      := false
+        inTokyoLong      := false
+        inSweepLong      := false   // [v6] reset P8 state
+        inNYSweepLong    := false   // [v7]
+        sweepRefLo       := na
+        longTargetLevel  := na
+        shortEntryPrice  := close
+        shortTargetLevel := f_shortTarget(close)
+        inSweepShort     := bearSweepAsian
+        if bearSweepAsian
+            sweepRefHi    := asianHigh
+            sweepEntryBar := bar_index
+
+else if pos == -1
+    primaryExitShort = not na(shortTargetLevel) and low <= shortTargetLevel
+    consExitShort    = reEntryFromAbove
+    obExitShort      = nearBullOB
+    tokyoExitShort   = inTokyoShort and (not inTokyo or
+         (not na(prevAsianHighCandidate) and high >= prevAsianHighCandidate))
+
+    // [v6 FIX 3] P8: exit if price re-closes through swept Asian high by reclaimPts
+    reclaimShort = inSweepShort and not na(sweepRefHi) and
+         (bar_index - sweepEntryBar) <= reclaimBars and
+         close > sweepRefHi + reclaimPts
+
+    // [v6 FIX 4] P9 structural VWAP exit for shorts
+    backstopShort =
+         (bullSweep and bullSweepScore >= 2) or
+         (close > vwap and (htfBullBias or poc > vwap) and not inDriftShort and not inTokyoShort)
+
+    if primaryExitShort or consExitShort or obExitShort or tokyoExitShort or reclaimShort
+        exitShort        := true
+        pos              := 0
+        shortTargetLevel := na
+        inDriftShort     := false
+        inTokyoShort     := false
+        inSweepShort     := false   // [v6] reset P8 state
+        sweepRefHi       := na
+
+    else if backstopShort
+        exitShort        := true
+        pos              := 0
+        shortTargetLevel := na
+        inDriftShort     := false
+        inTokyoShort     := false
+        inSweepShort     := false   // [v6] reset P8 state
+        sweepRefHi       := na
+
+    if pos == -1 and longCondition
+        exitShort        := true
+        buySignal        := true
+        pos              := 1
+        inDriftLong      := driftLong
+        inTokyoLong      := tokyoLong
+        inDriftShort     := false
+        inTokyoShort     := false
+        inSweepShort     := false   // [v6] reset P8 state
+        sweepRefHi       := na
+        shortTargetLevel := na
+        longEntryPrice   := close
+        longTargetLevel  := f_longTarget(close)
+        inSweepLong      := bullSweepAsian
+        if bullSweepAsian
+            sweepRefLo    := asianLow
+            sweepEntryBar := bar_index
+
+// ─────────────────────── PLOTS ───────────────────────
+
+plot(vwap, "VWAP", color=color.new(color.yellow,  0), linewidth=2)
+plot(poc,  "POC",  color=color.new(color.fuchsia, 0), linewidth=2, style=plot.style_circles)
+
+plot(lastHTFHigh, "HTF Swing High", color=color.new(color.red,  50), style=plot.style_linebr, linewidth=1)
+plot(lastHTFLow,  "HTF Swing Low",  color=color.new(color.lime, 50), style=plot.style_linebr, linewidth=1)
+plot(lastLTFHigh, "LTF Swing High", color=color.new(color.red,  75), style=plot.style_linebr, linewidth=1)
+plot(lastLTFLow,  "LTF Swing Low",  color=color.new(color.lime, 75), style=plot.style_linebr, linewidth=1)
+
+plot(asianHigh, "Asian High (Locked)", color=color.new(color.orange, 40), style=plot.style_linebr, linewidth=1)
+plot(asianLow,  "Asian Low  (Locked)", color=color.new(color.aqua,   40), style=plot.style_linebr, linewidth=1)
+plot(inTokyo ? asianHighCandidate : na, "Asian High (Live)", color=color.new(color.orange, 20), style=plot.style_linebr, linewidth=1)
+plot(inTokyo ? asianLowCandidate  : na, "Asian Low  (Live)", color=color.new(color.aqua,   20), style=plot.style_linebr, linewidth=1)
+
+// [v7 ADD 4] London Range lines — olive/yellow-green, dashed
+plot(londonHigh, "London High (Locked)", color=color.rgb(180, 200, 55, 40), style=plot.style_linebr, linewidth=1)
+plot(londonLow,  "London Low  (Locked)", color=color.rgb(180, 200, 55, 40), style=plot.style_linebr, linewidth=1)
+plot(inLondon and currentHour < nyOpen ? londonHighCandidate : na,
+     "London High (Live)", color=color.rgb(180, 200, 55, 15), style=plot.style_linebr, linewidth=1)
+plot(inLondon and currentHour < nyOpen ? londonLowCandidate  : na,
+     "London Low  (Live)", color=color.rgb(180, 200, 55, 15), style=plot.style_linebr, linewidth=1)
+
+// ── Layer 17: IB Plots ─────────────────────────────────────────────────────
+
+// Asian IB — violet
+plot(asianIBHigh,
+     "Asian IB High (Locked)", color=color.rgb(180, 100, 255, 45),
+     style=plot.style_linebr, linewidth=1)
+plot(asianIBLow,
+     "Asian IB Low  (Locked)", color=color.rgb(180, 100, 255, 45),
+     style=plot.style_linebr, linewidth=1)
+plot(inAsianIBHour ? asianIBHighBuild : na,
+     "Asian IB High (Live)", color=color.rgb(180, 100, 255, 10),
+     style=plot.style_linebr, linewidth=2)
+plot(inAsianIBHour ? asianIBLowBuild : na,
+     "Asian IB Low  (Live)", color=color.rgb(180, 100, 255, 10),
+     style=plot.style_linebr, linewidth=2)
+
+// London IB — lime green
+plot(londonIBHigh,
+     "London IB High (Locked)", color=color.rgb(130, 255, 100, 45),
+     style=plot.style_linebr, linewidth=1)
+plot(londonIBLow,
+     "London IB Low  (Locked)", color=color.rgb(130, 255, 100, 45),
+     style=plot.style_linebr, linewidth=1)
+plot(inLondonIBHour ? londonIBHighBuild : na,
+     "London IB High (Live)", color=color.rgb(130, 255, 100, 10),
+     style=plot.style_linebr, linewidth=2)
+plot(inLondonIBHour ? londonIBLowBuild : na,
+     "London IB Low  (Live)", color=color.rgb(130, 255, 100, 10),
+     style=plot.style_linebr, linewidth=2)
+
+// NY IB — sky blue
+plot(nyIBHigh,
+     "NY IB High (Locked)", color=color.rgb(55, 180, 255, 45),
+     style=plot.style_linebr, linewidth=1)
+plot(nyIBLow,
+     "NY IB Low  (Locked)", color=color.rgb(55, 180, 255, 45),
+     style=plot.style_linebr, linewidth=1)
+plot(inNYIBHour ? nyIBHighBuild : na,
+     "NY IB High (Live)", color=color.rgb(55, 180, 255, 10),
+     style=plot.style_linebr, linewidth=2)
+plot(inNYIBHour ? nyIBLowBuild : na,
+     "NY IB Low  (Live)", color=color.rgb(55, 180, 255, 10),
+     style=plot.style_linebr, linewidth=2)
+
+p1 = plot(poc,  display=display.none)
+p2 = plot(vwap, display=display.none)
+fill(p1, p2,
+     color = pocVwapBalance ? color.new(color.gray,  85) :
+             bullImbalance  ? color.new(color.green, 88) :
+             color.new(color.red, 88))
+
+// Order block zones
+if bearOBValid and not na(bearOBHigh)
+    box.new(bar_index - 8, bearOBHigh, bar_index, bearOBLow,
+         border_color=color.new(color.red,  55),
+         bgcolor     =color.new(color.red,  90))
+
+if bullOBValid and not na(bullOBHigh)
+    box.new(bar_index - 8, bullOBHigh, bar_index, bullOBLow,
+         border_color=color.new(color.lime, 55),
+         bgcolor     =color.new(color.lime, 90))
+
+// Consolidation zone
+if consZoneValid and not na(consZoneHigh)
+    box.new(bar_index - consBars, consZoneHigh, bar_index, consZoneLow,
+         border_color=color.new(color.gray, 55),
+         bgcolor     =color.new(color.gray, 90))
+
+// Active target line
+if pos == 1 and not na(longTargetLevel)
+    line.new(bar_index - 1, longTargetLevel, bar_index, longTargetLevel,
+         color=color.new(color.yellow, 25), style=line.style_dashed, width=1)
+
+if pos == -1 and not na(shortTargetLevel)
+    line.new(bar_index - 1, shortTargetLevel, bar_index, shortTargetLevel,
+         color=color.new(color.yellow, 25), style=line.style_dashed, width=1)
+
+// ─────────────────────── SIGNAL MARKERS ───────────────────────
+
+bullSweepColor = bullSweepScore == 3 ? color.lime   : bullSweepScore == 2 ? color.aqua   : color.new(color.aqua,   40)
+bearSweepColor = bearSweepScore == 3 ? color.red    : bearSweepScore == 2 ? color.orange : color.new(color.orange, 40)
+
+if bullSweep
+    label.new(bar_index, low,
+         text="S" + str.tostring(bullSweepScore),
+         style=label.style_triangleup,
+         color=bullSweepColor, textcolor=color.black,
+         size=size.small, yloc=yloc.belowbar)
+
+if bearSweep
+    label.new(bar_index, high,
+         text="S" + str.tostring(bearSweepScore),
+         style=label.style_triangledown,
+         color=bearSweepColor, textcolor=color.white,
+         size=size.small, yloc=yloc.abovebar)
+
+// Tokyo expansion markers
+plotshape(tokyoLong,
+     location=location.belowbar, style=shape.triangleup,
+     color=color.rgb(0, 220, 200, 0), size=size.small, text="TKY")
+
+plotshape(tokyoShort,
+     location=location.abovebar, style=shape.triangledown,
+     color=color.rgb(0, 220, 200, 0), size=size.small, text="TKY")
+
+// NY_SWEEP marker  [v7]
+plotshape(nySweepLong,
+     location=location.belowbar, style=shape.triangleup,
+     color=color.rgb(180, 200, 55, 0), size=size.small, text="NYS")
+
+// Drift markers
+plotshape(driftLong  and pos == 1,
+     location=location.belowbar, style=shape.triangleup,
+     color=color.new(color.lime, 35), size=size.tiny, text="D")
+
+plotshape(driftShort and pos == -1,
+     location=location.abovebar, style=shape.triangledown,
+     color=color.new(color.red, 35), size=size.tiny, text="D")
+
+plotshape(buySignal,
+     location=location.belowbar, style=shape.labelup,
+     color=color.new(color.lime, 0), textcolor=color.black,
+     size=size.normal, text="LONG")
+
+plotshape(sellSignal,
+     location=location.abovebar, style=shape.labeldown,
+     color=color.new(color.red, 0), textcolor=color.white,
+     size=size.normal, text="SHORT")
+
+plotshape(exitLong,
+     location=location.abovebar, style=shape.xcross,
+     color=color.new(color.white, 20), size=size.small, text="EXIT")
+
+plotshape(exitShort,
+     location=location.belowbar, style=shape.xcross,
+     color=color.new(color.white, 20), size=size.small, text="EXIT")
+
+plotshape(bullFakeout,
+     location=location.belowbar, style=shape.cross,
+     color=color.new(color.orange, 0), size=size.small, text="FAKE")
+
+plotshape(bearFakeout,
+     location=location.abovebar, style=shape.cross,
+     color=color.new(color.orange, 0), size=size.small, text="FAKE")
+
+plotshape(ibBullBreak,
+     location=location.belowbar, style=shape.diamond,
+     color=color.rgb(200, 130, 255, 0), size=size.tiny, text="IB+")
+
+plotshape(ibBearBreak,
+     location=location.abovebar, style=shape.diamond,
+     color=color.rgb(200, 130, 255, 0), size=size.tiny, text="IB-")
+
+plotshape(londonTransition and barstate.isnew,
+     location=location.top, style=shape.diamond,
+     color=color.new(color.yellow, 20), size=size.tiny, text="LON")
+
+plotshape(nyTransition and barstate.isnew,
+     location=location.top, style=shape.diamond,
+     color=color.new(color.blue, 20), size=size.tiny, text="NY")
+
+bgcolor(regimeVolatile ? color.new(color.red,  97) :
+        regimeDrift    ? color.new(color.blue, 97) : na)
+
+barcolor(
+     pos == 1  ? color.new(color.lime, 78) :
+     pos == -1 ? color.new(color.red,  78) :
+     pocVwapBalance ? color.new(color.gray, 85) : na)
+
+// ─────────────────────── DASHBOARD HUD ───────────────────────
+
+hudPosition =
+     hudPos == "Top Left"     ? position.top_left     :
+     hudPos == "Bottom Right" ? position.bottom_right :
+     hudPos == "Bottom Left"  ? position.bottom_left  :
+     position.top_right
+
+C_BG         = color.rgb(8,   10,  18,  5)
+C_BG_HEADER  = color.rgb(16,  20,  42,  5)
+C_BG_SECTION = color.rgb(14,  17,  32,  8)
+C_BG_LABEL   = color.rgb(11,  13,  24, 10)
+C_BG_VAL     = color.rgb(7,    9,  16,  8)
+C_BORDER     = color.rgb(35,  45,  80, 65)
+C_FRAME      = color.rgb(55,  80, 150, 45)
+C_LABEL      = color.rgb(95, 105, 135,  0)
+C_DIM        = color.rgb(55,  60,  85,  0)
+
+var table hud = table.new(
+     hudPosition, 2, 29,    // [v7] +1 row for LONDON RNG
+     bgcolor      = C_BG,
+     border_color = C_BORDER,
+     border_width = 1,
+     frame_color  = C_FRAME,
+     frame_width  = 2)
+
+if barstate.islast
+
+    // ── HEADER (row 0) ────────────────────────────────────────────────────
+    table.cell(hud, 0, 0, "LSE v7",
+         text_color=color.rgb(130, 160, 255, 0), text_size=size.normal,
+         bgcolor=C_BG_HEADER, text_halign=text.align_right)
+    table.cell(hud, 1, 0, syminfo.ticker,
+         text_color=color.rgb(255, 210, 55, 0), text_size=size.normal,
+         bgcolor=C_BG_HEADER, text_halign=text.align_left)
+
+    // ── MARKET (rows 1–4) ─────────────────────────────────────────────────
+    table.cell(hud, 0, 1, "MARKET", text_color=color.rgb(70, 90, 150, 0),
+         text_size=size.tiny, bgcolor=C_BG_SECTION, text_halign=text.align_left)
+    table.cell(hud, 1, 1, "", bgcolor=C_BG_SECTION)
+
+    regimeColor =
+         regimeVolatile ? color.rgb(255, 75,  75,  0) :
+         regimeDrift    ? color.rgb(70,  200, 255, 0) :
+         color.rgb(130, 130, 155, 0)
+    table.cell(hud, 0, 2, "REGIME",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 2, regimeLabel,
+         text_color=regimeColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    atrRatioColor =
+         atrRatio > 1.3  ? color.rgb(255, 75,  75,  0) :
+         atrRatio < 0.75 ? color.rgb(70,  200, 255, 0) :
+         color.rgb(155, 155, 175, 0)
+    table.cell(hud, 0, 3, "ATR RATIO",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 3, str.tostring(atrRatio, "#.##"),
+         text_color=atrRatioColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    stateColor =
+         pocVwapBalance ? color.rgb(120, 120, 145, 0) :
+         bullImbalance  ? color.rgb(70,  215, 115, 0) :
+         color.rgb(255, 75, 75, 0)
+    stateText = pocVwapBalance ? "BALANCE" : bullImbalance ? "BULL IMBAL" : "BEAR IMBAL"
+    table.cell(hud, 0, 4, "IMBALANCE",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 4, stateText,
+         text_color=stateColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    // ── LEVELS (rows 5–9) ─────────────────────────────────────────────────
+    table.cell(hud, 0, 5, "LEVELS", text_color=color.rgb(70, 90, 150, 0),
+         text_size=size.tiny, bgcolor=C_BG_SECTION, text_halign=text.align_left)
+    table.cell(hud, 1, 5, "", bgcolor=C_BG_SECTION)
+
+    table.cell(hud, 0, 6, "POC",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 6, str.tostring(poc, "#.##"),
+         text_color=color.rgb(215, 75, 255, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    table.cell(hud, 0, 7, "VWAP",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 7, str.tostring(vwap, "#.##"),
+         text_color=color.rgb(255, 210, 55, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    deltaColor = pocVwapDelta > 0 ? color.rgb(70, 215, 115, 0) : color.rgb(255, 75, 75, 0)
+    table.cell(hud, 0, 8, "POC-VWAP",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 8, str.tostring(pocVwapDelta, "#.##"),
+         text_color=deltaColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    tgtText =
+         pos == 1  and not na(longTargetLevel)  ? str.tostring(longTargetLevel,  "#.##") :
+         pos == -1 and not na(shortTargetLevel) ? str.tostring(shortTargetLevel, "#.##") : "--"
+    tgtColor =
+         pos == 1  ? color.rgb(70,  215, 115, 0) :
+         pos == -1 ? color.rgb(255,  75,  75, 0) :
+         C_DIM
+    tgtBg =
+         pos == 1  ? color.rgb(8,  38,  18, 5) :
+         pos == -1 ? color.rgb(38,  8,   8, 5) :
+         C_BG_VAL
+    table.cell(hud, 0, 9, "TARGET",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 9, tgtText,
+         text_color=tgtColor, text_size=size.small, bgcolor=tgtBg, text_halign=text.align_left)
+
+    // ── SESSION (rows 10–14) ──────────────────────────────────────────────
+    table.cell(hud, 0, 10, "SESSION", text_color=color.rgb(70, 90, 150, 0),
+         text_size=size.tiny, bgcolor=C_BG_SECTION, text_halign=text.align_left)
+    table.cell(hud, 1, 10, "", bgcolor=C_BG_SECTION)
+
+    sessionColor =
+         londonTransition or nyTransition ? color.rgb(255, 215, 55,  0) :
+         inLondon or inNY                 ? color.rgb(70,  200, 255, 0) :
+         color.rgb(95, 100, 120, 0)
+    table.cell(hud, 0, 11, "ACTIVE",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 11, sessionLabel,
+         text_color=sessionColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    htfColor =
+         htfBullBias ? color.rgb(70,  215, 115, 0) :
+         htfBearBias ? color.rgb(255,  75,  75, 0) :
+         color.rgb(125, 125, 145, 0)
+    htfText = htfBullBias ? "BULL  1H" : htfBearBias ? "BEAR  1H" : "NEUTRAL"
+    table.cell(hud, 0, 12, "HTF BIAS",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 12, htfText,
+         text_color=htfColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    arText = not na(asianHigh) ?
+         str.tostring(asianHigh, "#.##") + " / " + str.tostring(asianLow, "#.##") :
+         "Building..."
+    table.cell(hud, 0, 13, "ASIA RNG",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 13, arText,
+         text_color=color.rgb(255, 155, 55, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    // [v7 ADD 5] LONDON RNG row (row 14)
+    lrText = not na(londonHigh) ?
+         str.tostring(londonHigh, "#.##") + " / " + str.tostring(londonLow, "#.##") :
+         inLondon and currentHour < nyOpen ? "Building..." : "--"
+    table.cell(hud, 0, 14, "LONDON RNG",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 14, lrText,
+         text_color=color.rgb(180, 200, 55, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    tokyoBreakText =
+         tokyoBullBreakCount > 0 ? "BULL " + str.tostring(tokyoBullBreakCount) + "/" + str.tostring(tokyoConfBars) :
+         tokyoBearBreakCount > 0 ? "BEAR " + str.tostring(tokyoBearBreakCount) + "/" + str.tostring(tokyoConfBars) :
+         "--"
+    tokyoBreakColor =
+         tokyoBullBreakCount > 0 ? color.rgb(0, 220, 200, 0) :
+         tokyoBearBreakCount > 0 ? color.rgb(0, 220, 200, 0) :
+         C_DIM
+    table.cell(hud, 0, 15, "TKY BREAK",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 15, tokyoBreakText,
+         text_color=tokyoBreakColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    // ── INIT BAL / Layer 17 (rows 16–20) ──────────────────────────────────
+    table.cell(hud, 0, 16, "INIT BAL", text_color=color.rgb(180, 100, 255, 0),
+         text_size=size.tiny, bgcolor=C_BG_SECTION, text_halign=text.align_left)
+    table.cell(hud, 1, 16, "", bgcolor=C_BG_SECTION)
+
+    ibStateText =
+         ibBuilding               ? "BUILDING"  :
+         ibAbove                  ? "ABOVE IB"  :
+         ibBelow                  ? "BELOW IB"  :
+         ibInside                 ? "INSIDE IB" :
+         "--"
+    ibStateColor =
+         ibBuilding ? color.rgb(155, 155, 175, 0) :
+         ibAbove    ? color.rgb(70,  215, 115, 0) :
+         ibBelow    ? color.rgb(255,  75,  75, 0) :
+         ibInside   ? color.rgb(130, 130, 155, 0) :
+         C_DIM
+    ibStateBg =
+         ibAbove ? color.rgb(8,  38, 18, 5) :
+         ibBelow ? color.rgb(38,  8,  8, 5) :
+         C_BG_VAL
+    table.cell(hud, 0, 20, "IB STATE",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 20, ibStateText,
+         text_color=ibStateColor, text_size=size.small, bgcolor=ibStateBg, text_halign=text.align_left)
+
+    asianIBText =
+         inAsianIBHour and not na(asianIBHighBuild) ?
+             str.tostring(asianIBHighBuild, "#.##") + "/" + str.tostring(asianIBLowBuild, "#.##") :
+         not na(asianIBHigh) ?
+             str.tostring(asianIBHigh, "#.##") + "/" + str.tostring(asianIBLow, "#.##") :
+         "--"
+    table.cell(hud, 0, 20, "ASIAN IB",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 20, asianIBText,
+         text_color=color.rgb(180, 100, 255, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    londonIBText =
+         inLondonIBHour and not na(londonIBHighBuild) ?
+             str.tostring(londonIBHighBuild, "#.##") + "/" + str.tostring(londonIBLowBuild, "#.##") :
+         not na(londonIBHigh) ?
+             str.tostring(londonIBHigh, "#.##") + "/" + str.tostring(londonIBLow, "#.##") :
+         "--"
+    table.cell(hud, 0, 20, "LONDON IB",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 20, londonIBText,
+         text_color=color.rgb(130, 255, 100, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    nyIBText =
+         inNYIBHour and not na(nyIBHighBuild) ?
+             str.tostring(nyIBHighBuild, "#.##") + "/" + str.tostring(nyIBLowBuild, "#.##") :
+         not na(nyIBHigh) ?
+             str.tostring(nyIBHigh, "#.##") + "/" + str.tostring(nyIBLow, "#.##") :
+         "--"
+    table.cell(hud, 0, 20, "NY IB",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 20, nyIBText,
+         text_color=color.rgb(55, 180, 255, 0), text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    // ── SIGNALS (rows 21–25) ──────────────────────────────────────────────
+    table.cell(hud, 0, 21, "SIGNALS", text_color=color.rgb(70, 90, 150, 0),
+         text_size=size.tiny, bgcolor=C_BG_SECTION, text_halign=text.align_left)
+    table.cell(hud, 1, 21, "", bgcolor=C_BG_SECTION)
+
+    volColor =
+         volRank >= volPercentile       ? color.rgb(70,  215, 115, 0) :
+         volRank >= volPercentile * 0.8 ? color.rgb(200, 200,  70, 0) :
+         color.rgb(95, 100, 120, 0)
+    table.cell(hud, 0, 25, "VOL RANK",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 25, str.tostring(math.round(volRank)) + "%",
+         text_color=volColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    driftText =
+         bullMomentum and bullMicroConfirmed ? "BULL DRIFT" :
+         bearMomentum and bearMicroConfirmed ? "BEAR DRIFT" :
+         bullMomentum                        ? "BULL MOM"   :
+         bearMomentum                        ? "BEAR MOM"   : "--"
+    driftColor =
+         bullMomentum ? color.rgb(70,  215, 115, 0) :
+         bearMomentum ? color.rgb(255,  75,  75, 0) :
+         C_DIM
+    table.cell(hud, 0, 25, "DRIFT",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 25, driftText,
+         text_color=driftColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    bsColor =
+         bullSweepScore == 3 ? color.rgb(70,  215, 115, 0) :
+         bullSweepScore == 2 ? color.rgb(70,  195, 255, 0) : C_DIM
+    table.cell(hud, 0, 25, "BUY SWEEP",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 25,
+         bullSweep ? "S" + str.tostring(bullSweepScore) + " / 3" : "--",
+         text_color=bullSweep ? bsColor : C_DIM,
+         text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    ssColor =
+         bearSweepScore == 3 ? color.rgb(255,  75,  75, 0) :
+         bearSweepScore == 2 ? color.rgb(255, 155,  55, 0) : C_DIM
+    table.cell(hud, 0, 25, "SELL SWEEP",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 25,
+         bearSweep ? "S" + str.tostring(bearSweepScore) + " / 3" : "--",
+         text_color=bearSweep ? ssColor : C_DIM,
+         text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    // ── POSITION (rows 26–28) ─────────────────────────────────────────────
+    table.cell(hud, 0, 26, "POSITION", text_color=color.rgb(70, 90, 150, 0),
+         text_size=size.tiny, bgcolor=C_BG_SECTION, text_halign=text.align_left)
+    table.cell(hud, 1, 26, "", bgcolor=C_BG_SECTION)
+
+    entryTypeText =
+         inTokyoLong  or inTokyoShort  ? "TOKYO EXP" :
+         inDriftLong  or inDriftShort  ? "DRIFT"     :
+         inNYSweepLong                 ? "NY SWEEP"  :    // [v7]
+         inSweepLong  or inSweepShort  ? "LSE SWEEP" :
+         pos != 0                      ? "SWEEP"     : "--"
+    entryTypeColor =
+         inTokyoLong  or inTokyoShort  ? color.rgb(0,   220, 200, 0) :
+         inDriftLong  or inDriftShort  ? color.rgb(70,  200, 255, 0) :
+         inNYSweepLong                 ? color.rgb(180, 200,  55, 0) :    // [v7] olive
+         inSweepLong  or inSweepShort  ? color.rgb(255, 160,  40, 0) :
+         pos != 0                      ? color.rgb(255, 210,  55, 0) :
+         C_DIM
+    table.cell(hud, 0, 28, "ENTRY TYPE",
+         text_color=C_LABEL, text_size=size.small, bgcolor=C_BG_LABEL, text_halign=text.align_right)
+    table.cell(hud, 1, 28, entryTypeText,
+         text_color=entryTypeColor, text_size=size.small, bgcolor=C_BG_VAL, text_halign=text.align_left)
+
+    posColor =
+         pos == 1  ? color.rgb(70,  215, 115, 0) :
+         pos == -1 ? color.rgb(255,  75,  75, 0) :
+         color.rgb(120, 120, 145, 0)
+    posBg =
+         pos == 1  ? color.rgb(8,  42,  18, 3) :
+         pos == -1 ? color.rgb(42,  8,   8, 3) :
+         C_BG_VAL
+    posText = pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "FLAT"
+    table.cell(hud, 0, 28, "STATUS",
+         text_color=C_LABEL, text_size=size.small, bgcolor=posBg, text_halign=text.align_right)
+    table.cell(hud, 1, 28, posText,
+         text_color=posColor, text_size=size.small, bgcolor=posBg, text_halign=text.align_left)
