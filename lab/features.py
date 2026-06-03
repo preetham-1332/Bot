@@ -35,6 +35,7 @@ LONDON_IB_HOUR  = 7    # IB builds hour 7, available from hour 8
 NY_IB_HOUR      = 13   # IB builds hour 13, available from hour 14
 
 LONDON_SWEEP_HOUR = 7  # bullSweepAsian / bearSweepAsian only fire this hour
+NY_SWEEP_HOUR     = 13 # NY_SWEEP fires during NY open hour (13:00-13:55 UTC)
 
 # Pine input defaults
 ATR_LEN        = 14
@@ -89,6 +90,23 @@ def compute_asian_range(m5: pd.DataFrame) -> pd.DataFrame:
     sub["_date"] = sub.index.normalize()
     hi = sub.groupby("_date")["high"].max().rename("asian_range_high")
     lo = sub.groupby("_date")["low"].min().rename("asian_range_low")
+    return pd.concat([hi, lo], axis=1)
+
+
+# ── London Range (for NY_SWEEP) ──────────────────────────────────────────────
+
+def compute_london_range(m5: pd.DataFrame) -> pd.DataFrame:
+    """
+    London Range = max/min of all pre-NY London bars (07:00-12:55 UTC).
+    Fully confirmed before NY opens at 13:00.
+    Returns a date-indexed DataFrame: london_range_high, london_range_low.
+    """
+    h    = m5.index.hour
+    mask = (h >= LONDON_START) & (h < NY_START)
+    sub  = m5[mask].copy()
+    sub["_date"] = sub.index.normalize()
+    hi = sub.groupby("_date")["high"].max().rename("london_range_high")
+    lo = sub.groupby("_date")["low"].min().rename("london_range_low")
     return pd.concat([hi, lo], axis=1)
 
 
@@ -283,6 +301,11 @@ def attach_context(m5: pd.DataFrame) -> pd.DataFrame:
     ar = compute_asian_range(m5)
     out = out.join(ar, on="_date")
     out.loc[out["_h"] < LONDON_START, ["asian_range_high", "asian_range_low"]] = np.nan
+
+    # ── London Range (available from hour 13 / NY open onwards) ──────────────
+    lr = compute_london_range(m5)
+    out = out.join(lr, on="_date")
+    out.loc[out["_h"] < NY_START, ["london_range_high", "london_range_low"]] = np.nan
 
     # ── Session IBs (masked until confirmed) ─────────────────────────────────
     ibs = compute_ibs(m5)

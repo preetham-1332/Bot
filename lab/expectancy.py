@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 from lab.features import (
-    LONDON_SWEEP_HOUR, TOKYO_END,
+    LONDON_SWEEP_HOUR, NY_SWEEP_HOUR, TOKYO_END,
     TOKYO_BODY_MIN, TOKYO_CONF,
     DRIFT_BODY_MIN, DRIFT_BARS,
 )
@@ -101,6 +101,29 @@ def detect_signals(m5_ctx: pd.DataFrame) -> pd.DataFrame:
         & (m5_ctx["high"]  > m5_ctx["asian_range_high"])
         & (m5_ctx["close"] <= m5_ctx["asian_range_high"])
         & ((m5_ctx["high"] - m5_ctx["asian_range_high"]) > wick_thresh)
+        & (m5_ctx["bear_flow"] | m5_ctx["absorption"])
+    )
+
+    # ── NY_SWEEP (London Range sweep at NY open hour) ────────────────────────
+    at_ny_open  = h == NY_SWEEP_HOUR
+    has_london  = (m5_ctx["london_range_high"].notna() &
+                   m5_ctx["london_range_low"].notna())
+
+    ny_base = at_ny_open & has_london & not_drift
+
+    ny_long = (
+        ny_base
+        & (m5_ctx["low"]   < m5_ctx["london_range_low"])
+        & (m5_ctx["close"] >= m5_ctx["london_range_low"])
+        & ((m5_ctx["london_range_low"] - m5_ctx["low"]) > wick_thresh)
+        & (m5_ctx["bull_flow"] | m5_ctx["absorption"])
+    )
+
+    ny_short = (
+        ny_base
+        & (m5_ctx["high"]  > m5_ctx["london_range_high"])
+        & (m5_ctx["close"] <= m5_ctx["london_range_high"])
+        & ((m5_ctx["high"] - m5_ctx["london_range_high"]) > wick_thresh)
         & (m5_ctx["bear_flow"] | m5_ctx["absorption"])
     )
 
@@ -171,6 +194,8 @@ def detect_signals(m5_ctx: pd.DataFrame) -> pd.DataFrame:
     masks = {
         ("LSE_SWEEP",   "long"):  lse_long,
         ("LSE_SWEEP",   "short"): lse_short,
+        ("NY_SWEEP",    "long"):  ny_long,
+        ("NY_SWEEP",    "short"): ny_short,
         ("TOKYO_BREAK", "long"):  tokyo_long,
         ("TOKYO_BREAK", "short"): tokyo_short,
         ("DRIFT",       "long"):  drift_long,
@@ -225,8 +250,10 @@ def simulate(signals: pd.DataFrame,
     n      = len(opens)
 
     # P8 arrays
-    asian_hi = m5_ctx["asian_range_high"].to_numpy()
-    asian_lo = m5_ctx["asian_range_low"].to_numpy()
+    asian_hi  = m5_ctx["asian_range_high"].to_numpy()
+    asian_lo  = m5_ctx["asian_range_low"].to_numpy()
+    london_hi = m5_ctx["london_range_high"].to_numpy()
+    london_lo = m5_ctx["london_range_low"].to_numpy()
 
     # P9 arrays
     vwaps     = m5_ctx["vwap"].to_numpy()          if vwap_exit else None
@@ -264,9 +291,13 @@ def simulate(signals: pd.DataFrame,
             continue
 
         # ── P8: reclaim filter (LSE_SWEEP only) ───────────────────────────────
-        if reclaim_filter and row["setup"] == "LSE_SWEEP":
-            ref_hi = asian_hi[sig_pos]
-            ref_lo = asian_lo[sig_pos]
+        if reclaim_filter and row["setup"] in ("LSE_SWEEP", "NY_SWEEP"):
+            if row["setup"] == "LSE_SWEEP":
+                ref_hi = asian_hi[sig_pos]
+                ref_lo = asian_lo[sig_pos]
+            else:
+                ref_hi = london_hi[sig_pos]
+                ref_lo = london_lo[sig_pos]
             check_end = min(entry_pos + RECLAIM_BARS, n)
             invalidated = False
             for rb in range(entry_pos, check_end):
