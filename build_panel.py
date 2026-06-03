@@ -64,20 +64,30 @@ def load_broker_d1(path: Path) -> pd.DataFrame:
 def fetch_fred(series_id: str) -> pd.Series:
     """
     Download a FRED series via the public graph-CSV endpoint (no API key).
+    Retries up to 3 times with increasing timeouts (15 / 30 / 60 s).
     Returns a daily Series with NaN where FRED records a missing value (".").
     """
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    df = pd.read_csv(
-        io.StringIO(resp.text),
-        index_col=0,
-        parse_dates=True,
-        na_values=".",
-    )
-    s = df.iloc[:, 0]
-    s.index.name = "date"
-    return s
+    last_exc: Exception | None = None
+    for attempt, timeout in enumerate([15, 30, 60], 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            df = pd.read_csv(
+                io.StringIO(resp.text),
+                index_col=0,
+                parse_dates=True,
+                na_values=".",
+            )
+            s = df.iloc[:, 0]
+            s.index.name = "date"
+            return s
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 3:
+                print(f"attempt {attempt} failed ({type(exc).__name__}), retrying ...",
+                      end=" ", flush=True)
+    raise last_exc  # type: ignore[misc]
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -113,13 +123,20 @@ def main() -> None:
         )
 
     # 3. FRED ------------------------------------------------------------------
+    # Load old panel now (before overwriting) so we can preserve stale FRED values
+    # if the fetch fails. ffill(limit=5) covers a long weekend.
+    old_panel: pd.DataFrame | None = None
+    if OUT_PATH.exists():
+        try:
+            old_panel = pd.read_csv(OUT_PATH, index_col=0, parse_dates=True)
+        except Exception:
+            pass
+
     print("Fetching FRED series …")
     for series_id, col_name in _FRED.items():
         print(f"  {series_id} -> {col_name} ... ", end="", flush=True)
         try:
             raw = fetch_fred(series_id).rename(col_name)
-            # align to trading days: union index → sort → ffill gaps (max 7 days)
-            # → reindex back to XAU days only
             aligned = (
                 raw
                 .reindex(xau_idx.union(raw.index))
@@ -131,7 +148,16 @@ def main() -> None:
             n_ok = aligned.notna().sum()
             print(f"{n_ok:,} non-NaN / {len(xau_idx):,} rows")
         except Exception as exc:
-            print(f"FAILED — {exc}")
+            print(f"FAILED -- {exc}")
+            # Fall back to previous panel values if available
+            if old_panel is not None and col_name in old_panel.columns:
+                cached = old_panel[col_name].reindex(xau_idx).ffill(limit=5)
+                n_cached = cached.notna().sum()
+                if n_cached > 0:
+                    panel[col_name] = cached
+                    print(f"  Using cached values from previous panel "
+                          f"({n_cached:,} non-NaN, ffill+5d).")
+                    continue
             print(f"  Warning: {col_name} will be all-NaN.", file=sys.stderr)
             panel[col_name] = float("nan")
 

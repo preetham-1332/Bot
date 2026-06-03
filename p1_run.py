@@ -53,44 +53,50 @@ def main():
     print(f"Panel: {len(panel):,} rows  "
           f"{panel.index[0].date()} -> {panel.index[-1].date()}")
 
-    pca, scaler, feats = fit_macro_pca(panel)
+    macro_ok = False
+    mc = pd.Series(float("nan"), index=panel.index, name="macro_composite")
+    try:
+        pca, scaler, feats = fit_macro_pca(panel)
+        macro_ok = True
+    except ValueError as exc:
+        print(f"\n  [WARN] Macro PCA skipped: {exc}")
+        print("  macro_composite will be NaN this run.")
+        print("  Session composite is unaffected -- continuing.\n")
 
-    # Variance explained
-    exp_var = pca.explained_variance_ratio_
-    print(f"\nVariance explained by each PC:")
-    cumvar = 0.0
-    for i, v in enumerate(exp_var):
-        cumvar += v
-        print(f"  PC{i+1}: {v*100:5.1f}%   cumulative: {cumvar*100:5.1f}%")
+    if macro_ok:
+        # Variance explained
+        exp_var = pca.explained_variance_ratio_
+        print(f"\nVariance explained by each PC:")
+        cumvar = 0.0
+        for i, v in enumerate(exp_var):
+            cumvar += v
+            print(f"  PC{i+1}: {v*100:5.1f}%   cumulative: {cumvar*100:5.1f}%")
 
-    print(f"\nPC1 captures {exp_var[0]*100:.1f}% of variance in the dollar/rates cluster")
-    print(f"\n{macro_loadings_report(pca, exp_var)}")
+        print(f"\nPC1 captures {exp_var[0]*100:.1f}% of variance in the dollar/rates cluster")
+        print(f"\n{macro_loadings_report(pca, exp_var)}")
 
-    # Correlation of PC1 with gold 20D return
-    mc = compute_macro_composite(panel, pca, scaler)
-    gold_ret20 = np.log(panel["xau_close"] / panel["xau_close"].shift(20))
-    shared = mc.dropna().index.intersection(gold_ret20.dropna().index)
-    corr = np.corrcoef(mc.reindex(shared), gold_ret20.reindex(shared))[0, 1]
-    print(f"\nPC1 vs XAU 20D return correlation: {corr:+.4f}")
+        mc = compute_macro_composite(panel, pca, scaler)
+        gold_ret20 = np.log(panel["xau_close"] / panel["xau_close"].shift(20))
+        shared = mc.dropna().index.intersection(gold_ret20.dropna().index)
+        corr = np.corrcoef(mc.reindex(shared), gold_ret20.reindex(shared))[0, 1]
+        print(f"\nPC1 vs XAU 20D return correlation: {corr:+.4f}")
 
-    # Individual factor correlations with gold
-    print("\nIndividual feature correlations with XAU 20D return:")
-    feat_names = ["usd", "real10y", "nom10y", "eur", "jpy"]
-    for col, name in zip(feats.columns, feat_names):
-        shared_f = feats[col].dropna().index.intersection(gold_ret20.dropna().index)
-        c = np.corrcoef(feats[col].reindex(shared_f),
-                        gold_ret20.reindex(shared_f))[0, 1]
-        print(f"  {name:<10}  {c:+.4f}")
+        feat_names = ["usd", "real10y", "nom10y", "eur", "jpy"]
+        print("\nIndividual feature correlations with XAU 20D return:")
+        for col, name in zip(feats.columns, feat_names):
+            shared_f = feats[col].dropna().index.intersection(gold_ret20.dropna().index)
+            c = np.corrcoef(feats[col].reindex(shared_f),
+                            gold_ret20.reindex(shared_f))[0, 1]
+            print(f"  {name:<10}  {c:+.4f}")
 
-    # Save loadings
-    load_df = pd.DataFrame(
-        pca.components_,
-        columns=feat_names,
-        index=[f"PC{i+1}" for i in range(5)],
-    )
-    load_df.insert(0, "var_pct", exp_var * 100)
-    load_df.to_csv(OUT_DIR / "macro_loadings.csv")
-    print(f"\nLoadings -> outputs/macro_loadings.csv")
+        load_df = pd.DataFrame(
+            pca.components_,
+            columns=feat_names,
+            index=[f"PC{i+1}" for i in range(5)],
+        )
+        load_df.insert(0, "var_pct", exp_var * 100)
+        load_df.to_csv(OUT_DIR / "macro_loadings.csv")
+        print(f"\nLoadings -> outputs/macro_loadings.csv")
 
     # ------------------------------------------------------------------
     # 2. Score and update daily_panel.csv
@@ -101,31 +107,30 @@ def main():
     print(SEP)
 
     panel["macro_composite"] = mc
-    panel["macro_score"]     = _quintile_score(mc)
+    panel["macro_score"]     = _quintile_score(mc) if macro_ok else float("nan")
 
-    # Last 10 macro scores
-    recent = panel[["xau_close", "macro_composite", "macro_score",
-                     "regime"]].dropna(subset=["macro_score"]).tail(10)
-    from lab.regime import NAMES as RN
-    print("\nMost recent 10 days:")
-    print(f"  {'date':<12} {'xau_close':>10} {'macro_comp':>11} "
-          f"{'macro_score':>12} {'regime':>7}")
-    print(f"  {'-'*12} {'-'*10} {'-'*11} {'-'*12} {'-'*7}")
-    for dt, row in recent.iterrows():
-        reg = RN.get(int(row["regime"]), "?") if not np.isnan(row["regime"]) else "?"
-        print(f"  {str(dt.date()):<12} {row['xau_close']:>10.2f} "
-              f"{row['macro_composite']:>+11.4f} "
-              f"{int(row['macro_score']):>+12}   {reg:>7}")
+    if macro_ok:
+        from lab.regime import NAMES as RN
+        recent = panel[["xau_close", "macro_composite", "macro_score",
+                         "regime"]].dropna(subset=["macro_score"]).tail(10)
+        print("\nMost recent 10 days:")
+        print(f"  {'date':<12} {'xau_close':>10} {'macro_comp':>11} "
+              f"{'macro_score':>12} {'regime':>7}")
+        print(f"  {'-'*12} {'-'*10} {'-'*11} {'-'*12} {'-'*7}")
+        for dt, row in recent.iterrows():
+            reg = RN.get(int(row["regime"]), "?") if not np.isnan(row["regime"]) else "?"
+            print(f"  {str(dt.date()):<12} {row['xau_close']:>10.2f} "
+                  f"{row['macro_composite']:>+11.4f} "
+                  f"{int(row['macro_score']):>+12}   {reg:>7}")
+
+        sc = panel["macro_score"].dropna().astype(int)
+        print("\nMacro score distribution:")
+        for v in [-2, -1, 0, 1, 2]:
+            n = (sc == v).sum()
+            print(f"  {v:+d}  {n:>5}  ({100*n/len(sc):.1f}%)")
 
     panel.to_csv(ROOT / "daily_panel.csv")
     print("\ndaily_panel.csv updated with macro_composite + macro_score.")
-
-    # Score distribution
-    sc = panel["macro_score"].dropna().astype(int)
-    print("\nMacro score distribution:")
-    for v in [-2, -1, 0, 1, 2]:
-        n = (sc == v).sum()
-        print(f"  {v:+d}  {n:>5}  ({100*n/len(sc):.1f}%)")
 
     # ------------------------------------------------------------------
     # 3. Session composite (M5)
@@ -183,7 +188,10 @@ def main():
     combined = macro_recent.join(sess_recent, how="inner")
     combined.index = combined.index.normalize()
 
+    from lab.regime import NAMES as RN
     print("\nLast 10 combined signals (macro_score + session_score):")
+    if not macro_ok:
+        print("  [macro scores are NaN -- FRED unavailable; combined = session only]")
     print(f"  {'date':<12} {'macro':>7} {'session':>9} {'combined':>10} {'regime':>7}")
     print(f"  {'-'*12} {'-'*7} {'-'*9} {'-'*10} {'-'*7}")
     for dt, row in combined.tail(10).iterrows():

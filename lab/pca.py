@@ -92,6 +92,12 @@ def fit_macro_pca(panel: pd.DataFrame
     PC1 is sign-flipped so that +ve correlates with gold 20-day returns.
     """
     feats  = _macro_feature_matrix(panel)
+    if feats.empty:
+        raise ValueError(
+            "Macro feature matrix is empty -- FRED columns (us10y_nominal, "
+            "us10y_real, usd_broad) are all NaN.  Run build_panel.py first; "
+            "if FRED is unreachable the cached values will be used automatically."
+        )
     scaler = StandardScaler()
     X      = scaler.fit_transform(feats.values)
 
