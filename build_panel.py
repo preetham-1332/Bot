@@ -63,12 +63,39 @@ def load_broker_d1(path: Path) -> pd.DataFrame:
 
 
 def _parse_fred_csv(text_or_path) -> pd.Series:
-    """Read a FRED CSV (DATE col + value col, '.' = NaN) from text or file path."""
-    if isinstance(text_or_path, (str, io.StringIO)):
-        src = text_or_path if isinstance(text_or_path, io.StringIO) else io.StringIO(text_or_path)
+    """
+    Read a FRED file into a dated Series.  Handles three formats:
+      - Standard FRED CSV (YYYY-MM-DD, downloaded via fredgraph.csv URL)
+      - Non-standard CSV (DD-MM-YYYY, e.g. from TradingView / data portals)
+      - XLSX with 2 junk rows before DATE/VALUE header (FRED Excel download)
+    """
+    import re
+
+    # ── xlsx ──────────────────────────────────────────────────────────────────
+    if isinstance(text_or_path, Path) and text_or_path.suffix.lower() == ".xlsx":
+        df = pd.read_excel(text_or_path, skiprows=2, header=0)
+        df.columns = ["date", "value"]
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        s = pd.to_numeric(df.set_index("date")["value"], errors="coerce")
+        s.index.name = "date"
+        return s
+
+    # ── CSV (from path, str, or StringIO) ─────────────────────────────────────
+    if isinstance(text_or_path, Path):
+        raw = text_or_path.read_text(encoding="utf-8")
+    elif isinstance(text_or_path, io.StringIO):
+        raw = text_or_path.read()
     else:
-        src = text_or_path   # Path object
-    df = pd.read_csv(src, index_col=0, parse_dates=True, na_values=".")
+        raw = text_or_path   # plain string
+
+    # Detect DD-MM-YYYY format (e.g. "02-01-1962") vs YYYY-MM-DD ("1962-01-02")
+    lines = raw.strip().splitlines()
+    first_date = lines[1].split(",")[0].strip().strip('"') if len(lines) > 1 else ""
+    dayfirst = bool(re.match(r"^\d{2}-\d{2}-\d{4}$", first_date))
+
+    df = pd.read_csv(io.StringIO(raw), index_col=0, parse_dates=True,
+                     dayfirst=dayfirst, na_values=".")
     s = df.iloc[:, 0]
     s.index.name = "date"
     return s
@@ -90,6 +117,12 @@ def fetch_fred(series_id: str) -> pd.Series:
     if local.exists():
         s = _parse_fred_csv(local)
         print(f"local file ({len(s):,} rows)", end="")
+        return s
+
+    local_xlsx = FRED_DIR / f"{series_id}.xlsx"
+    if local_xlsx.exists():
+        s = _parse_fred_csv(local_xlsx)
+        print(f"local xlsx ({len(s):,} rows)", end="")
         return s
 
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
