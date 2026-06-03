@@ -1,0 +1,16 @@
+# Generated data — rebuild with build_panel.py / p*_run.py
+daily_panel.csv
+outputs/
+
+# Broker CSV exports — large, sensitive, not code
+historical data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
