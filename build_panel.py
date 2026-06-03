@@ -26,9 +26,10 @@ import pandas as pd
 import requests
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-ROOT     = Path(__file__).parent
-D1_DIR   = ROOT / "historical data" / "D1"
-OUT_PATH = ROOT / "daily_panel.csv"
+ROOT      = Path(__file__).parent
+D1_DIR    = ROOT / "historical data" / "D1"
+FRED_DIR  = ROOT / "historical data" / "fred"   # manual FRED CSV fallback
+OUT_PATH  = ROOT / "daily_panel.csv"
 
 # broker CSVs: tab-sep, 7 data cols, 6-name header (MT4 export)
 # pandas auto-promotes col-0 (datetime) to index when header count < data count
@@ -61,26 +62,47 @@ def load_broker_d1(path: Path) -> pd.DataFrame:
     return df.sort_index()
 
 
+def _parse_fred_csv(text_or_path) -> pd.Series:
+    """Read a FRED CSV (DATE col + value col, '.' = NaN) from text or file path."""
+    if isinstance(text_or_path, (str, io.StringIO)):
+        src = text_or_path if isinstance(text_or_path, io.StringIO) else io.StringIO(text_or_path)
+    else:
+        src = text_or_path   # Path object
+    df = pd.read_csv(src, index_col=0, parse_dates=True, na_values=".")
+    s = df.iloc[:, 0]
+    s.index.name = "date"
+    return s
+
+
 def fetch_fred(series_id: str) -> pd.Series:
     """
-    Download a FRED series via the public graph-CSV endpoint (no API key).
-    Retries up to 3 times with increasing timeouts (15 / 30 / 60 s).
-    Returns a daily Series with NaN where FRED records a missing value (".").
+    Load a FRED series.  Priority:
+      1. Local file  historical data/fred/<series_id>.csv  (manual download)
+      2. FRED graph endpoint  (3 retries: 15 / 30 / 60 s)
+
+    To use local files: paste this URL in your browser and Save As to the
+    historical data/fred/ folder (create the folder first if it doesn't exist):
+      https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10
+      https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10
+      https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTWEXBGS
     """
+    local = FRED_DIR / f"{series_id}.csv"
+    if local.exists():
+        s = _parse_fred_csv(local)
+        print(f"local file ({len(s):,} rows)", end="")
+        return s
+
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     last_exc: Exception | None = None
     for attempt, timeout in enumerate([15, 30, 60], 1):
         try:
             resp = requests.get(url, timeout=timeout)
             resp.raise_for_status()
-            df = pd.read_csv(
-                io.StringIO(resp.text),
-                index_col=0,
-                parse_dates=True,
-                na_values=".",
-            )
-            s = df.iloc[:, 0]
-            s.index.name = "date"
+            s = _parse_fred_csv(io.StringIO(resp.text))
+            # Cache locally so next run is instant
+            FRED_DIR.mkdir(parents=True, exist_ok=True)
+            local.write_text(resp.text, encoding="utf-8")
+            print(f"downloaded + cached to {local.name}", end="")
             return s
         except Exception as exc:
             last_exc = exc
