@@ -117,7 +117,11 @@ def download_cot(years: list[int] | None = None,
         age = (date.today() - date.fromtimestamp(cache_path.stat().st_mtime)).days
         if age < STALE_DAYS:
             try:
-                return pd.read_csv(cache_path, parse_dates=["date"])
+                cached = pd.read_csv(cache_path, parse_dates=["date"])
+                # Recompute metrics if cache was written without them
+                if "net_spec_pct" not in cached.columns:
+                    cached = _add_cot_metrics(cached)
+                return cached
             except Exception:
                 pass
 
